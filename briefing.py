@@ -7,10 +7,21 @@ import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from email.utils import make_msgid
+from pathlib import Path
 
 import feedparser
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+LOGO_PATH = Path(__file__).parent / "assets" / "logo.webp"
+
+ACCENTS = ["#4F46E5", "#0EA5E9", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6"]
+
+
+def _truncate(text, limit=220):
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
 # Official sources and established technical news sources.
 FEEDS = [
@@ -188,30 +199,107 @@ def collect_stories():
     return stories[:MAX_STORIES]
 
 
-def make_email(stories):
-    today = datetime.now().strftime("%d %b %Y")
+def make_email(stories, logo_cid=None):
+    today = datetime.now().strftime("%A, %d %B %Y")
     sections = {}
-
     for story in stories:
-        category = story["category"]
-        sections.setdefault(category, []).append(story)
+        sections.setdefault(story["category"], []).append(story)
 
-    parts = [
-        "<html><body style='font-family:Arial,sans-serif;"
-        "max-width:760px;margin:auto;color:#222'>",
-        f"<h1>Daily Technology Briefing — {today}</h1>",
-        "<p>Rule-based digest from selected technology feeds. "
-        "Read original sources before acting on a claim.</p>",
-    ]
+    max_score = max((s["score"] for s in stories), default=0) or 1
 
-    if not stories:
-        parts.append(
-            "<p>No recent stories were collected. This may mean "
-            "there were no new items or a feed was unavailable.</p>"
+    if logo_cid:
+        logo_html = (
+            f"<img src='cid:{logo_cid}' alt='Logo' height='44' "
+            "style='display:block;height:44px;width:auto;border:0'>"
+        )
+    else:
+        logo_html = (
+            "<span style='font-size:20px;font-weight:700;color:#ffffff'>"
+            "Tech Briefing</span>"
         )
 
-    for category, items in sections.items():
-        parts.append(f"<h2>{html.escape(category)}</h2>")
+    p = []
+    p.append(
+        "<!DOCTYPE html><html lang='en'><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta name='color-scheme' content='light'>"
+        "<title>Daily Technology Briefing</title></head>"
+        "<body style='margin:0;padding:0;background:#F1F5F9;"
+        "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,"
+        "Arial,sans-serif;color:#1E293B'>"
+    )
+
+    # Hidden preheader (inbox preview text)
+    p.append(
+        "<div style='display:none;max-height:0;overflow:hidden;opacity:0'>"
+        f"{len(stories)} stories across {len(sections)} topics for {today}"
+        "</div>"
+    )
+
+    p.append(
+        "<table role='presentation' width='100%' cellpadding='0' "
+        "cellspacing='0' style='background:#F1F5F9'><tr>"
+        "<td align='center' style='padding:24px 12px'>"
+        "<table role='presentation' width='640' cellpadding='0' "
+        "cellspacing='0' style='width:100%;max-width:640px'>"
+    )
+
+    # ---- Header ----
+    p.append(
+        "<tr><td style='background:#0F172A;border-radius:16px 16px 0 0;"
+        "padding:28px 32px'>"
+        "<table role='presentation' width='100%' cellpadding='0' "
+        "cellspacing='0'><tr>"
+        f"<td align='left' valign='middle'>{logo_html}</td>"
+        "<td align='right' valign='middle' style='color:#94A3B8;"
+        f"font-size:12px;letter-spacing:.5px'>{html.escape(today)}</td>"
+        "</tr></table>"
+        "<h1 style='margin:24px 0 6px;font-size:26px;line-height:1.25;"
+        "color:#ffffff;font-weight:700'>Daily Technology Briefing</h1>"
+        f"<p style='margin:0;font-size:14px;color:#CBD5E1'>"
+        f"{len(stories)} stories · {len(sections)} topics</p>"
+        "</td></tr>"
+        # accent strip
+        "<tr><td style='height:4px;background:#4F46E5;font-size:0;"
+        "line-height:0'>&nbsp;</td></tr>"
+    )
+
+    # ---- Body ----
+    p.append(
+        "<tr><td style='background:#ffffff;padding:28px 32px 8px'>"
+        "<p style='margin:0 0 8px;font-size:14px;line-height:1.6;"
+        "color:#475569'>Here is your rule-based digest from selected "
+        "technology feeds. Read the original sources before acting on "
+        "any claim.</p></td></tr>"
+    )
+
+    if not stories:
+        p.append(
+            "<tr><td style='background:#ffffff;padding:16px 32px 32px'>"
+            "<div style='background:#FEF3C7;border-left:4px solid #F59E0B;"
+            "padding:14px 16px;border-radius:6px;font-size:14px;"
+            "color:#92400E'>No recent stories were collected. This may "
+            "mean there were no new items or a feed was unavailable."
+            "</div></td></tr>"
+        )
+
+    for idx, (category, items) in enumerate(sections.items()):
+        accent = ACCENTS[idx % len(ACCENTS)]
+
+        p.append(
+            "<tr><td style='background:#ffffff;padding:20px 32px 4px'>"
+            "<table role='presentation' width='100%' cellpadding='0' "
+            "cellspacing='0'><tr>"
+            f"<td style='border-bottom:2px solid {accent};padding-bottom:8px'>"
+            f"<span style='display:inline-block;background:{accent};"
+            "color:#ffffff;font-size:11px;font-weight:700;"
+            "letter-spacing:1px;text-transform:uppercase;padding:5px 12px;"
+            f"border-radius:999px'>{html.escape(category)}</span>"
+            f"<span style='color:#94A3B8;font-size:12px;margin-left:10px'>"
+            f"{len(items)} {'story' if len(items) == 1 else 'stories'}</span>"
+            "</td></tr></table></td></tr>"
+        )
 
         for item in items:
             title = html.escape(item["title"])
@@ -219,43 +307,79 @@ def make_email(stories):
             source = html.escape(item["source"])
             score = item["score"]
             date = (
-                item["published"].strftime("%d %b %Y %H:%M UTC")
+                item["published"].strftime("%d %b %Y, %H:%M UTC")
                 if item["published"]
-                else "Publication date unavailable"
+                else "Date unavailable"
             )
 
-            parts.append("<div style='margin-bottom:20px'>")
-            parts.append(
-                f"<p><strong><a href='{url}'>{title}</a></strong></p>"
-            )
-            parts.append(
-                f"<p><small>{source} · {date} · "
-                f"Priority score: {score}</small></p>"
+            desc = (
+                html.escape(_truncate(item["description"]))
+                if item["description"]
+                else "Open the original link for the full details."
             )
 
-            if item["description"]:
-                description = html.escape(item["description"])
-                parts.append(f"<p>{description}</p>")
+            ratio = score / max_score
+            if ratio >= 0.66:
+                pill_bg, pill_fg = "#DCFCE7", "#166534"
+            elif ratio >= 0.33:
+                pill_bg, pill_fg = "#FEF9C3", "#854D0E"
             else:
-                parts.append(
-                    "<p>Open the original link for the full details.</p>"
-                )
+                pill_bg, pill_fg = "#E2E8F0", "#475569"
 
+            tags = ""
             if item["matched"]:
-                keywords = ", ".join(item["matched"][:5])
-                parts.append(
-                    f"<p><small>Matched topics: "
-                    f"{html.escape(keywords)}</small></p>"
+                tags = "".join(
+                    "<span style='display:inline-block;background:#F1F5F9;"
+                    "color:#475569;font-size:11px;padding:3px 9px;"
+                    "border-radius:6px;margin:6px 6px 0 0'>"
+                    f"{html.escape(k)}</span>"
+                    for k in item["matched"][:5]
                 )
 
-            parts.append("</div><hr>")
+            p.append(
+                "<tr><td style='background:#ffffff;padding:14px 32px 0'>"
+                "<table role='presentation' width='100%' cellpadding='0' "
+                "cellspacing='0' style='border:1px solid #E2E8F0;"
+                f"border-left:4px solid {accent};border-radius:10px'>"
+                "<tr><td style='padding:16px 18px'>"
+                "<table role='presentation' width='100%' cellpadding='0' "
+                "cellspacing='0'><tr>"
+                "<td style='font-size:12px;color:#64748B'>"
+                f"<strong style='color:#334155'>{source}</strong>"
+                f" · {date}</td>"
+                "<td align='right'>"
+                f"<span style='background:{pill_bg};color:{pill_fg};"
+                "font-size:11px;font-weight:700;padding:3px 9px;"
+                f"border-radius:999px;white-space:nowrap'>Score {score}</span>"
+                "</td></tr></table>"
+                f"<a href='{url}' style='display:block;margin-top:10px;"
+                "font-size:17px;line-height:1.35;font-weight:700;"
+                f"color:#0F172A;text-decoration:none'>{title}</a>"
+                f"<p style='margin:8px 0 0;font-size:14px;line-height:1.6;"
+                f"color:#475569'>{desc}</p>"
+                f"<div>{tags}</div>"
+                f"<a href='{url}' style='display:inline-block;margin-top:14px;"
+                f"background:{accent};color:#ffffff;font-size:13px;"
+                "font-weight:600;text-decoration:none;padding:8px 16px;"
+                "border-radius:8px'>Read article →</a>"
+                "</td></tr></table></td></tr>"
+            )
 
-    parts.append(
-        "<p><small>Priority scores are keyword-based, not verified "
-        "severity ratings. This digest may miss important stories.</small></p>"
+    # ---- Footer ----
+    p.append(
+        "<tr><td style='background:#ffffff;padding:24px 32px'></td></tr>"
+        "<tr><td style='background:#0F172A;border-radius:0 0 16px 16px;"
+        "padding:22px 32px;text-align:center'>"
+        "<p style='margin:0 0 6px;font-size:12px;line-height:1.6;"
+        "color:#94A3B8'>Priority scores are keyword-based, not verified "
+        "severity ratings. This digest may miss important stories.</p>"
+        f"<p style='margin:0;font-size:11px;color:#64748B'>"
+        f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')}</p>"
+        "</td></tr>"
     )
-    parts.append("</body></html>")
-    return "".join(parts)
+
+    p.append("</table></td></tr></table></body></html>")
+    return "".join(p)
 
 
 def send_email(stories):
@@ -270,11 +394,30 @@ def send_email(stories):
     message["From"] = sender
     message["To"] = recipient
     message.set_content(
-        f"Daily Technology Briefing\n\n"
+        "Daily Technology Briefing\n\n"
         f"{len(stories)} stories collected.\n"
         "Open this email in an HTML-capable mail client to read the digest."
     )
-    message.add_alternative(make_email(stories), subtype="html")
+
+    logo_cid = None
+    if LOGO_PATH.exists():
+        logo_cid = make_msgid(domain="techbriefing.local")
+
+    message.add_alternative(
+        make_email(stories, logo_cid.strip("<>") if logo_cid else None),
+        subtype="html",
+    )
+
+    if logo_cid:
+        html_part = message.get_payload()[1]
+        html_part.add_related(
+            LOGO_PATH.read_bytes(),
+            maintype="image",
+            subtype="png",
+            cid=logo_cid,
+        )
+    else:
+        logging.warning("Logo not found at %s; sending without it", LOGO_PATH)
 
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
         server.starttls()
