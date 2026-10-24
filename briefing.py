@@ -12,7 +12,7 @@ import feedparser
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-LOGO_URL = "https://cdn.jsdelivr.net/gh/mohamed-ashif-m/tech-bites@main/assets/logo.webp"
+LOGO_URL = "https://cdn.jsdelivr.net/gh/mohamed-ashif-m/tech-bites@main/assets/logo-tb.png"
 
 ACCENTS = ["#4F46E5", "#0EA5E9", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6"]
 
