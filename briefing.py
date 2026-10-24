@@ -7,14 +7,12 @@ import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from email.utils import make_msgid
-from pathlib import Path
 
 import feedparser
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-LOGO_PATH = Path(__file__).parent / "assets" / "logo.webp"
+LOGO_URL = "https://cdn.jsdelivr.net/gh/mohamed-ashif-m/tech-bites@main/assets/logo.webp"
 
 ACCENTS = ["#4F46E5", "#0EA5E9", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6"]
 
@@ -199,7 +197,7 @@ def collect_stories():
     return stories[:MAX_STORIES]
 
 
-def make_email(stories, logo_cid=None):
+def make_email(stories, logo_url=None):
     today = datetime.now().strftime("%A, %d %B %Y")
     sections = {}
     for story in stories:
@@ -207,9 +205,9 @@ def make_email(stories, logo_cid=None):
 
     max_score = max((s["score"] for s in stories), default=0) or 1
 
-    if logo_cid:
+    if logo_url:
         logo_html = (
-            f"<img src='cid:{logo_cid}' alt='Logo' height='44' "
+            f"<img src='{html.escape(logo_url, quote=True)}' alt='Logo' height='44' "
             "style='display:block;height:44px;width:auto;border:0'>"
         )
     else:
@@ -399,25 +397,7 @@ def send_email(stories):
         "Open this email in an HTML-capable mail client to read the digest."
     )
 
-    logo_cid = None
-    if LOGO_PATH.exists():
-        logo_cid = make_msgid(domain="techbriefing.local")
-
-    message.add_alternative(
-        make_email(stories, logo_cid.strip("<>") if logo_cid else None),
-        subtype="html",
-    )
-
-    if logo_cid:
-        html_part = message.get_payload()[1]
-        html_part.add_related(
-            LOGO_PATH.read_bytes(),
-            maintype="image",
-            subtype="png",
-            cid=logo_cid,
-        )
-    else:
-        logging.warning("Logo not found at %s; sending without it", LOGO_PATH)
+    message.add_alternative(make_email(stories, LOGO_URL), subtype="html")
 
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
         server.starttls()
