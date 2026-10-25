@@ -3,8 +3,8 @@ name: Daily Technology Briefing
 
 on:
   schedule:
-    # Runs daily at 08:47 India Standard Time (03:17 UTC).
-    - cron: "17 3 * * *"
+    # Runs daily at 11:00 AM India Standard Time (5:30 UTC).
+    - cron: "30 5 * * *"
   workflow_dispatch:
 
 permissions:
