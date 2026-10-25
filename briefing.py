@@ -1,4 +1,3 @@
-
 import os
 import re
 import html
@@ -14,43 +13,79 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 LOGO_URL = "https://cdn.jsdelivr.net/gh/mohamed-ashif-m/tech-bites@main/assets/logo-tb.png"
 
-ACCENTS = ["#4F46E5", "#0EA5E9", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6"]
+ACCENTS = [
+    "#4F46E5", "#0EA5E9", "#10B981", "#F59E0B",
+    "#EF4444", "#8B5CF6", "#EC4899", "#14B8A6",
+]
 
 
 def _truncate(text, limit=220):
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
+
 # Official sources and established technical news sources.
 FEEDS = [
-    {
-        "name": "GitHub Blog",
-        "url": "https://github.blog/feed/",
-        "category": "Open Source",
-        "base_score": 2,
-    },
-    {
-        "name": "GitHub Security Advisories",
-        "url": "https://github.com/advisories.atom",
-        "category": "Security",
-        "base_score": 4,
-    },
-    {
-        "name": "Cloudflare Blog",
-        "url": "https://blog.cloudflare.com/rss/",
-        "category": "Infrastructure",
-        "base_score": 2,
-    },
-    {
-        "name": "BleepingComputer",
-        "url": "https://www.bleepingcomputer.com/feed/",
-        "category": "Security News",
-        "base_score": 2,
-    },
+    # ---- Open source / dev platforms ----
+    {"name": "GitHub Blog", "url": "https://github.blog/feed/",
+     "category": "Open Source", "base_score": 2},
+
+    # ---- Security ----
+    {"name": "GitHub Security Advisories", "url": "https://github.com/advisories.atom",
+     "category": "Security", "base_score": 4},
+    {"name": "CISA Advisories", "url": "https://www.cisa.gov/cybersecurity-advisories/all.xml",
+     "category": "Security", "base_score": 4},
+    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/",
+     "category": "Security", "base_score": 2},
+    {"name": "Krebs on Security", "url": "https://krebsonsecurity.com/feed/",
+     "category": "Security", "base_score": 3},
+    {"name": "Google Security Blog", "url": "https://security.googleblog.com/feeds/posts/default",
+     "category": "Security", "base_score": 3},
+    {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews",
+     "category": "Security", "base_score": 2},
+
+    # ---- General tech news ----
+    {"name": "Ars Technica", "url": "https://feeds.arstechnica.com/arstechnica/index",
+     "category": "Tech News", "base_score": 2},
+    {"name": "MIT Technology Review", "url": "https://www.technologyreview.com/feed/",
+     "category": "Tech News", "base_score": 3},
+    {"name": "IEEE Spectrum", "url": "https://spectrum.ieee.org/feeds/feed.rss",
+     "category": "Tech News", "base_score": 2},
+    {"name": "BBC Technology", "url": "https://feeds.bbci.co.uk/news/technology/rss.xml",
+     "category": "Tech News", "base_score": 2},
+    {"name": "The Register", "url": "https://www.theregister.com/headlines.atom",
+     "category": "Tech News", "base_score": 1},
+
+    # ---- AI ----
+    {"name": "OpenAI News", "url": "https://openai.com/news/rss.xml",
+     "category": "AI", "base_score": 3},
+    {"name": "Google AI Blog", "url": "https://blog.google/technology/ai/rss/",
+     "category": "AI", "base_score": 2},
+    {"name": "Hugging Face Blog", "url": "https://huggingface.co/blog/feed.xml",
+     "category": "AI", "base_score": 2},
+    {"name": "NVIDIA Blog", "url": "https://blogs.nvidia.com/feed/",
+     "category": "AI", "base_score": 1},
+
+    # ---- Engineering / cloud ----
+    {"name": "Cloudflare Blog", "url": "https://blog.cloudflare.com/rss/",
+     "category": "Infrastructure", "base_score": 2},
+    {"name": "AWS News Blog", "url": "https://aws.amazon.com/blogs/aws/feed/",
+     "category": "Infrastructure", "base_score": 1},
+    {"name": "InfoQ", "url": "https://feed.infoq.com/",
+     "category": "Engineering", "base_score": 1},
+
+    # ---- India & policy ----
+    {"name": "MEDIANAMA", "url": "https://www.medianama.com/feed/",
+     "category": "India & Policy", "base_score": 2},
+
+    # ---- Community signal (aggregator, so lowest base score) ----
+    {"name": "Hacker News (200+ points)", "url": "https://hnrss.org/frontpage?points=200",
+     "category": "Community", "base_score": 0},
 ]
 
 # Higher scores mean greater priority. These rules are only heuristics.
 KEYWORDS = {
+    # Security
     "critical": 6,
     "actively exploited": 7,
     "known exploited": 7,
@@ -66,17 +101,29 @@ KEYWORDS = {
     "vulnerability": 3,
     "security update": 3,
     "patch": 2,
+    "reverse engineering": 3,
+    # General engineering / open source
     "release": 2,
     "open source": 1,
+    "open-source": 1,
+    "developer tools": 1,
+    # AI
     "artificial intelligence": 2,
     "machine learning": 2,
     "large language model": 2,
+    "open-source model": 3,
     "llm": 1,
-    "reverse engineering": 3,
-    "developer tools": 1,
+    # Hardware, infrastructure, policy
+    "semiconductor": 3,
+    "chip": 2,
+    "quantum": 3,
+    "data center": 2,
+    "regulation": 2,
+    "outage": 3,
 }
 
-MAX_STORIES = 25
+MAX_STORIES = 30
+MAX_PER_CATEGORY = 4
 LOOKBACK_HOURS = 48
 
 
@@ -115,6 +162,43 @@ def score_story(title, description, base_score):
 def story_id(url, title):
     value = url.strip() or title.strip()
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sort_key(story):
+    return (
+        story["score"],
+        story["published"] or datetime.min.replace(tzinfo=timezone.utc),
+    )
+
+
+def select_stories(stories):
+    """Pick the best stories while keeping every category represented.
+
+    Pass 1: take the top MAX_PER_CATEGORY stories from each category.
+    Pass 2: if there is room left under MAX_STORIES, fill it with the
+    highest-scoring leftovers regardless of category.
+    """
+    ranked = sorted(stories, key=_sort_key, reverse=True)
+
+    per_category = {}
+    chosen, leftovers = [], []
+
+    for story in ranked:
+        count = per_category.get(story["category"], 0)
+        if count < MAX_PER_CATEGORY:
+            chosen.append(story)
+            per_category[story["category"]] = count + 1
+        else:
+            leftovers.append(story)
+
+    # If categories alone exceed the overall cap, keep the best overall.
+    if len(chosen) > MAX_STORIES:
+        chosen = chosen[:MAX_STORIES]
+    else:
+        chosen.extend(leftovers[: MAX_STORIES - len(chosen)])
+
+    chosen.sort(key=_sort_key, reverse=True)
+    return chosen
 
 
 def collect_stories():
@@ -185,16 +269,7 @@ def collect_stories():
         except Exception:
             logging.exception("Failed to fetch %s", feed["name"])
 
-    # Prioritize relevance, then the newest publication date.
-    stories.sort(
-        key=lambda s: (
-            s["score"],
-            s["published"] or datetime.min.replace(tzinfo=timezone.utc),
-        ),
-        reverse=True,
-    )
-
-    return stories[:MAX_STORIES]
+    return select_stories(stories)
 
 
 def make_email(stories, logo_url=None):
