@@ -4,6 +4,7 @@ import io
 import html
 import smtplib
 import hashlib
+import time
 import logging
 import calendar
 import urllib.parse
@@ -131,6 +132,8 @@ MAX_PER_CATEGORY = 4
 LOOKBACK_HOURS = 24
 
 # ---- Article photos ----
+SMTP_TIMEOUT = 120        # seconds per network operation (photos make the email large)
+SMTP_ATTEMPTS = 3
 MAX_IMAGES = 22          # photos placed in one issue (~35 KB each after processing)
 IMAGE_CANDIDATES = 30    # try to find a photo for every selected story
 IMAGE_SHARE = 0.6        # in each section ~60% of stories get a picture; the other ~40% are text-only
@@ -147,7 +150,18 @@ INK = "#1B1712"
 PAPER = "#F4EAD3"
 DESK = "#D9CBA8"
 RULE_SOFT = "#B9A98A"
+# Overall email width in px. 600-700 is the traditional safe size; 800 reads
+# better on desktop and still shrinks to fit phones and narrow preview panes.
+EMAIL_WIDTH = 800
+CONTENT_WIDTH = EMAIL_WIDTH - 64                  # inside the 32px side padding
+GRID_PHOTO_WIDTH = (CONTENT_WIDTH - 30) // 2      # one column of the 2-column grid
+LEAD_PHOTO_WIDTH = CONTENT_WIDTH - 70             # inside the dark top-story box
+
 RED_INK = "#8B1A1A"
+DARK = "#2B1D13"        # inverted "contrast box" used for the top story
+DARK_TEXT = "#E6D9BC"
+DARK_MUTED = "#CDBB95"
+DARK_RED = "#F0A58F"
 
 
 # --------------------------------------------------------------------------
@@ -360,7 +374,7 @@ def vintage_jpeg(data, size):
         gray = ImageOps.autocontrast(ImageOps.grayscale(image), cutoff=1)
         image = ImageOps.colorize(gray, black="#1B1208", mid="#8A6F4D", white="#F2E4C4")
         out = io.BytesIO()
-        image.save(out, "JPEG", quality=72, optimize=True, progressive=True)
+        image.save(out, "JPEG", quality=66, optimize=True, progressive=True)
         return out.getvalue()
     except Exception as exc:
         logging.info("Could not process image (%s)", exc)
@@ -465,6 +479,8 @@ a{{color:{INK}}}
   .colr{{border-left:none!important;padding-left:0!important}}
   .fluid{{width:100%!important;max-width:none!important;height:auto!important}}
   .lead{{font-size:26px!important;line-height:1.15!important}}
+  .leadbox{{padding:6px!important}}
+  .leadin{{padding:14px!important}}
   .meta{{font-size:9.5px!important;letter-spacing:.5px!important}}
 }}
 """
@@ -510,7 +526,7 @@ def make_email(stories, images=None):
         inline.append((cid, data, subtype, filename))
         return cid[1:-1]
 
-    def photo(story, size, shown_width):
+    def photo(story, size, shown_width, border=INK):
         """Sepia print of the story's photo, or "" if it has none."""
         raw = images.get(story["id"])
         jpeg = vintage_jpeg(raw, size) if raw else None
@@ -521,17 +537,18 @@ def make_email(stories, images=None):
             f"<img src='cid:{cid}' width='{shown_width}' "
             f"alt='Photo: {esc(story['source'], quote=True)}' "
             f"class='fluid' style='display:block;width:100%;max-width:{shown_width}px;"
-            f"height:auto;border:1px solid {INK};margin:0 0 8px'>"
+            f"height:auto;border:1px solid {border};margin:0 0 8px'>"
         )
 
-    def kicker(story, with_category=False):
+    def kicker(story, with_category=False, dark=False):
         parts = [esc(story["source"]), _fmt_dt(story["published"])]
         if with_category:
             parts.insert(1, esc(story["category"]))
         text = " · ".join(parts)
         if story["score"] / max_score >= 0.66:
-            text = f"<span style='color:{RED_INK}'>● Priority</span> · " + text
-        return f"<div class='kick'>{text}</div>"
+            text = f"<span style='color:{DARK_RED if dark else RED_INK}'>● Priority</span> · " + text
+        colour = f" style='color:{DARK_MUTED}'" if dark else ""
+        return f"<div class='kick'{colour}>{text}</div>"
 
     def summary(story, limit):
         if story["description"]:
@@ -558,14 +575,14 @@ def make_email(stories, images=None):
     p.append(
         f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='background:{DESK}'>"
         "<tr><td align='center' style='padding:20px 10px'>"
-        f"<table role='presentation' class='wrap' width='680' cellpadding='0' cellspacing='0' "
-        f"style='width:100%;max-width:680px;background:{PAPER};border:1px solid {INK}'>"
+        f"<table role='presentation' class='wrap' width='{EMAIL_WIDTH}' cellpadding='0' cellspacing='0' "
+        f"style='width:100%;max-width:{EMAIL_WIDTH}px;background:{PAPER};border:1px solid {INK}'>"
     )
 
     # ---- Masthead ----
     masthead = (
-        f"<img src='{html.escape(MASTHEAD_URL, quote=True)}' width='616' alt='The Tech Bites Daily' class='fluid' "
-        "style='display:block;width:100%;max-width:616px;height:auto;border:0;margin:0 auto'>"
+        f"<img src='{html.escape(MASTHEAD_URL, quote=True)}' width='{CONTENT_WIDTH}' alt='The Tech Bites Daily' class='fluid' "
+        f"style='display:block;width:100%;max-width:{CONTENT_WIDTH}px;height:auto;border:0;margin:0 auto'>"
     )
     p.append(f"<tr><td class='pad' style='padding:18px 32px 0'>{masthead}</td></tr>")
 
@@ -588,18 +605,25 @@ def make_email(stories, images=None):
             "or a feed was unavailable.</p></td></tr>"
         )
 
-    # ---- Lead story ----
+    # ---- Lead story: inverted (dark) box so the main highlight stands out ----
     if lead:
         url = esc(lead["url"], quote=True)
         p.append(
             "<tr><td class='pad' style='padding:18px 32px 6px'>"
-            f"{kicker(lead, with_category=True)}"
-            f"<a href='{url}' class='head lead' style='display:block;margin:6px 0 12px;color:{INK};"
+            f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+            f"style='background:{DARK};border:1px solid {INK}'><tr>"
+            f"<td class='leadbox' style='padding:10px'>"
+            f"<div class='leadin' style='border:3px double #7C6948;padding:20px 22px'>"
+            f"<div class='kick' style='text-align:center;color:{DARK_MUTED};letter-spacing:5px;"
+            f"padding-bottom:10px'>★ Top Story ★</div>"
+            f"{kicker(lead, with_category=True, dark=True)}"
+            f"<a href='{url}' class='head lead' style='display:block;margin:6px 0 14px;color:{PAPER};"
             f"font-size:32px;line-height:1.12'>{esc(lead['title'])}</a>"
-            f"{photo(lead, (960, 480), 616)}"
-            f"<p class='body' style='font-size:15px'>{summary(lead, 420)}</p>"
-            f"<p style='margin:10px 0 0'><a href='{url}' class='more' style='color:{INK}'>Continue reading →</a></p>"
-            "</td></tr>"
+            f"{photo(lead, (1000, 500), LEAD_PHOTO_WIDTH, border=DARK_MUTED)}"
+            f"<p class='body' style='font-size:15px;color:{DARK_TEXT}'>{summary(lead, 420)}</p>"
+            f"<p style='margin:12px 0 0'><a href='{url}' class='more' "
+            f"style='color:{PAPER}'>Continue reading →</a></p>"
+            "</div></td></tr></table></td></tr>"
         )
 
     # ---- Sections ----
@@ -607,7 +631,8 @@ def make_email(stories, images=None):
         url = esc(story["url"], quote=True)
         img = ""
         if with_photo:
-            img = photo(story, (960, 400), 616) if wide else photo(story, (480, 320), 280)
+            img = (photo(story, (1000, 420), CONTENT_WIDTH) if wide
+               else photo(story, (520, 347), GRID_PHOTO_WIDTH))
         size = 22 if wide else 18
         # text-only stories have more room, so they can carry a longer summary
         limit = (300 if wide else 220) if not with_photo else (260 if wide else 170)
@@ -707,10 +732,23 @@ def send_email(stories, images):
 
     message = build_message(stories, images, sender, recipient)
 
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
-        server.starttls()
-        server.login(sender, password)
-        server.send_message(message)
+    size_kb = len(message.as_bytes()) // 1024
+    logging.info("Sending email (%d KB)...", size_kb)
+
+    # The message carries the photos, so give a slow connection plenty of time
+    # and retry a couple of times if the upload is cut off.
+    for attempt in range(1, SMTP_ATTEMPTS + 1):
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=SMTP_TIMEOUT) as server:
+                server.starttls()
+                server.login(sender, password)
+                server.send_message(message)
+            break
+        except (OSError, smtplib.SMTPServerDisconnected) as exc:
+            logging.warning("Send attempt %d/%d failed: %s", attempt, SMTP_ATTEMPTS, exc)
+            if attempt == SMTP_ATTEMPTS:
+                raise
+            time.sleep(5 * attempt)
 
     logging.info("Email sent to %s", recipient)
 
