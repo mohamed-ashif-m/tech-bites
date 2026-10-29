@@ -1,6 +1,5 @@
-# The Tech Bites Daily
-
-A small Python project that reads technology, security and AI news from trusted RSS feeds, ranks the stories, and emails you a once-a-day digest laid out like an old newspaper: blackletter masthead, ruled columns, sepia photos, and a dark "Top Story" box.
+<p align="center"> <h1 align="center">The Tech Bites Daily</h1>
+An Useful Python project that reads technology, security and AI news from trusted RSS feeds, ranks the stories, and emails you a once-a-day digest laid out like an old newspaper: blackletter masthead, ruled columns, sepia photos, and a dark "Top Story" box.
 
 It runs for free on **GitHub Actions**, and a free **Cloudflare Worker** starts it at an exact time every day (GitHub's own scheduler is often hours late).
 
@@ -20,25 +19,31 @@ It runs for free on **GitHub Actions**, and a free **Cloudflare Worker** starts 
 
 ## What you get
 
-- **~20 trusted sources** across security, tech news, AI, infrastructure, engineering and India policy.
+- **~25 trusted sources** across security, tech news, AI, infrastructure, engineering, business, India policy and the developer community.
 - **Ranking by simple, transparent rules**: a per-feed base score plus keyword points (for example "actively exploited" or "zero-day").
 - **Newspaper layout**: dateline, issue number, a dark "Top Story" box, ruled two-column sections, and a "Priority" marker for the highest-ranked stories.
 - **Photos in a vintage look**: pulled from each article, cropped and converted to sepia. In each section about 60% of stories get a picture and the rest are text-only.
-- **Mobile friendly**: columns stack into one on phones.
+- **"Talk of the Town" board**: the most-voted Hacker News stories as a ranked list with a points stamp (a dark "HOT" stamp at 500+ points), a short description of the article, the comment count, and links to both the article and the discussion.
+- **Security alerts from official data**: critical GitHub advisories and CISA's Known Exploited Vulnerabilities list, read from their JSON data rather than RSS.
+- **Mobile friendly**: columns stack into one on phones, with a separate compact masthead.
+- **Resilient**: feeds and images are retried when a connection drops, so one bad request doesn't lose a source.
 - **Plain-text fallback** for mail clients that don't show HTML.
 
 ## How it works
 
-1. **Fetch.** For every entry in `FEEDS`, the script reads the feed with `feedparser` and keeps the title, link, publish time and the first 700 characters of the description.
+1. **Fetch.** For every entry in `FEEDS`, the script reads the feed with `feedparser` (retrying up to 3 times if the connection drops) and keeps the title, link, publish time and the first 700 characters of the description. Two sources have no usable RSS feed, so they are read as JSON instead (marked with a `format` field in `FEEDS`):
+   - **GitHub Security Advisories** from GitHub's API: the newest *critical* reviewed advisories, at most 5.
+   - **CISA Known Exploited** from CISA's Known Exploited Vulnerabilities catalogue (with a GitHub mirror as backup): flaws added within the look-back window, at most 5. CISA publishes only the date, so these are timed at the end of that day.
 2. **Filter.** Entries with no link are skipped, duplicate links are counted once, and anything older than `LOOKBACK_HOURS` is dropped. Entries with no date are kept but lose 2 points.
-3. **Score.** `score = feed base_score + points for every keyword found in the title or description` (each keyword counts once). Matching is plain text, so `chip` also matches "chipset".
-4. **Select.** Stories are sorted by score (newer first when tied). The top `MAX_PER_CATEGORY` of each category are taken first so every topic is represented, then leftover slots up to `MAX_STORIES` go to the best remaining stories from any category.
+3. **Score and combine.** `score = feed base_score + points for every keyword found in the title or description` (each keyword counts once). Matching is plain text, so `chip` also matches "chipset". Headlines from different outlets about the same event are then combined into one story that earns `CROSS_SOURCE_BONUS` points for each extra outlet, so big stories reported everywhere rise to the top and show an "Also reported by ..." line.
+4. **Select.** Stories are sorted by score (newer first when tied). The top `MAX_PER_CATEGORY` (3) of each category are taken first so every topic is represented, then leftover slots up to `MAX_STORIES` go to the best remaining stories from any category.
 5. **Order.**
    - The **lead story** is the highest-scoring story among the top 6 that has a photo.
    - **Sections** appear in the order of their best story's rank.
    - Inside a section, picture stories come first, then text-only ones, filling left to right.
+   - **Talk of the Town** (the Hacker News section) is the exception: it is a single-column board sorted by **points**, highest first, and it never supplies the lead story or takes a photo slot.
    - The email is ranked by score, **not** in time order. The time on each story is its publish time in IST.
-6. **Photos.** The script looks for a photo in the feed entry, then falls back to the article page's `og:image`. Photos are downloaded, cropped, converted to sepia and attached to the email as inline images.
+6. **Photos and descriptions.** The script looks for a photo in the feed entry, then falls back to the article page's `og:image`. Photos are downloaded (with one retry), cropped, converted to sepia and attached to the email as inline images. Hacker News items carry no text, so for those the script opens each article and uses its own page description (`og:description` or the meta description) as the short summary. If a site blocks the request, that story simply shows without a description.
 7. **Send.** The email is sent through Gmail SMTP with a long timeout and automatic retries.
 
 ## Project structure
@@ -48,7 +53,8 @@ tech-bites/
 ├── briefing.py                  # the whole program
 ├── requirements.txt             # feedparser, Pillow
 ├── assets/
-│   └── masthead.png             # blackletter masthead (served via jsDelivr)
+│   ├── masthead.png             # wide blackletter masthead for desktop (served via jsDelivr)
+│   └── masthead-mobile.png      # compact masthead shown on phones
 ├── .github/
 │   └── workflows/
 │       └── daily.yml            # GitHub Actions workflow (manual trigger only)
@@ -153,43 +159,9 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `EMAIL_APP_PASSWORD` | the 16-character app password |
 | `EMAIL_TO` | where to deliver the digest (can be the same address) |
 
-### 2. Add the workflow
+### 2. The workflow
 
-`.github/workflows/daily.yml`:
-
-```yaml
-name: Daily Technology Briefing
-
-on:
-  workflow_dispatch:   # triggered at the chosen time by the Cloudflare Worker
-
-permissions:
-  contents: read
-
-jobs:
-  send-briefing:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Collect stories and send digest
-        env:
-          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
-          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python briefing.py
-```
+The workflow already lives in the repo at `.github/workflows/daily.yml`. It has only a `workflow_dispatch:` trigger (no `schedule:`), installs the requirements, and runs `python briefing.py` with the three secrets above as environment variables.
 
 ### 3. Test it
 
@@ -331,17 +303,18 @@ All settings are constants near the top of `briefing.py`.
 
 | Setting | What it does | Suggested |
 |---|---|---|
-| `FEEDS` | list of sources: `name`, `url`, `category`, `base_score` | see [Customising](#customising) |
+| `FEEDS` | list of sources: `name`, `url`, `category`, `base_score` (plus `format` for the two JSON sources) | see [Customising](#customising) |
 | `KEYWORDS` | words and the points they add to a story's score | edit freely |
 | `MAX_STORIES` | maximum stories in one email | `30` |
-| `MAX_PER_CATEGORY` | guaranteed slots per category before the leftover fill | `4` |
-| `LOOKBACK_HOURS` | how far back to look for stories | `24` for a daily digest (the script ships with `48`) |
+| `MAX_PER_CATEGORY` | guaranteed slots per category before the leftover fill | `3` |
+| `CROSS_SOURCE_BONUS` / `CROSS_SOURCE_BONUS_MAX` | points added per extra outlet covering the same story, and the cap | `4` / `12` |
+| `LOOKBACK_HOURS` | how far back to look for stories (also applies to the GitHub and CISA security sources) | `24` for a daily digest (the script ships with `48`) |
 | `IMAGE_SHARE` | share of each section's stories that get a photo | `0.6` (60%) |
 | `MAX_IMAGES` | cap on photos downloaded per email | `22` |
 | `EMAIL_WIDTH` | overall email width in pixels | `800` (use 700 or less for maximum compatibility) |
 | `SMTP_TIMEOUT` / `SMTP_ATTEMPTS` | upload patience and retries | `120` / `3` |
 | `FIRST_ISSUE` | date used for the "No. N" issue counter | your launch date |
-| `MASTHEAD_URL` | where the masthead image is loaded from | your jsDelivr link |
+| `MASTHEAD_URL` / `MASTHEAD_MOBILE_URL` | where the desktop and phone masthead images are loaded from | your jsDelivr links |
 
 ### A note on `LOOKBACK_HOURS`
 
@@ -364,6 +337,14 @@ Add an entry to `FEEDS`:
 - `base_score` is how much you trust or prioritise the source (0 to 4 is typical).
 - Test a feed first: `python -c "import feedparser; print(len(feedparser.parse('URL').entries))"`
 
+### The Community section
+
+Hacker News is read from `https://hnrss.org/frontpage?points=200`, so only stories with 200+ points appear. Change the number in that URL to be pickier or more generous. The "HOT" stamp threshold (500 points) is the `hot = ... >= 500` line in `make_email`. Stories in the `Community` category are shown in the Talk of the Town board; to turn the board off, delete that feed from `FEEDS`.
+
+### Security sources
+
+`GitHub Security Advisories` and `CISA Known Exploited` use `"format": "github_advisories"` and `"format": "cisa_kev"`. To see more or fewer items, change the `[:5]` at the end of `github_advisory_entries` and `cisa_kev_entries`. To include *high* as well as *critical* advisories, change `severity=critical` in the GitHub URL.
+
 ### Change what counts as important
 
 Edit `KEYWORDS`. Every keyword found in a story's title or description adds its points once. Higher points push stories toward the top and into the "Priority" band (anything scoring at least two thirds of the day's top score).
@@ -373,7 +354,7 @@ Edit `KEYWORDS`. Every keyword found in a story's title or description adds its 
 - **Width:** `EMAIL_WIDTH`.
 - **Colours:** `INK`, `PAPER`, `DESK`, `DARK` and related constants.
 - **Photo share:** `IMAGE_SHARE`.
-- **Masthead:** replace `assets/masthead.png` (about 1264 x 256 px works well) and make sure `MASTHEAD_URL` points to it. jsDelivr caches files, so add a version to the URL (for example `@v2`) or wait a while after replacing the image.
+- **Masthead:** replace `assets/masthead.png` (about 1264 x 256 px works well) and, for phones, `assets/masthead-mobile.png` (about 1020 x 246 px), and make sure `MASTHEAD_URL` and `MASTHEAD_MOBILE_URL` point to them. Clients that don't support phone styles simply show the desktop masthead. jsDelivr caches files, so add a version to the URL (for example `@v2`) or wait a while after replacing the image.
 
 ---
 
@@ -381,8 +362,12 @@ Edit `KEYWORDS`. Every keyword found in a story's title or description adds its 
 
 | Problem | What to check |
 |---|---|
-| `Could not read feed: ...` | the feed URL changed, or the site blocks scripts. Try the URL in a browser, find the current feed link, or try a browser-like `User-Agent` |
-| A feed shows `fetched 0 entries` | the URL returns no items to a script. Check it in a browser and compare |
+| `Could not read feed: ...` | the feed URL changed, or the site blocks scripts. The script already retried 3 times. Try the URL in a browser, find the current feed link, or try a browser-like `User-Agent` |
+| A feed shows `fetched 0 entries` | the URL returns no items to a script, or (for the security sources) nothing new met the criteria in the look-back window. Check the URL in a browser |
+| `Failed to fetch <source>` with `RemoteDisconnected` | a dropped connection on your side. It is retried automatically; if it repeats, check your network or VPN |
+| Image lines such as `Image download failed ... timed out` | slow or blocked image hosts. Harmless: that story is shown without a photo |
+| `og:image lookup failed ... 403` (for example OpenAI) | the publisher blocks scripts. Harmless: no photo for that story |
+| A Talk of the Town story has no description | the article's site blocked the lookup or has no page description. The title and links still work |
 | `SMTPAuthenticationError (535)` | wrong app password, or 2-Step Verification is off. Create a new app password |
 | `SMTPServerDisconnected` or "write operation timed out" | the email is large and the upload was cut off. The script retries 3 times with a 120-second timeout; also check your internet connection |
 | `KeyError: 'EMAIL_ADDRESS'` | the environment variables aren't set in this terminal (or the GitHub secrets are missing) |
@@ -390,7 +375,8 @@ Edit `KEYWORDS`. Every keyword found in a story's title or description adds its 
 | Masthead image missing | the file isn't in the repo at `assets/masthead.png`, or `MASTHEAD_URL` is wrong. Open the URL in a browser to check |
 | Headlines look blue | an old version of the script. Links must carry the ink colour inline; use the current `briefing.py` |
 | Two emails per day | both a GitHub `schedule:` and the Cloudflare trigger are active. Remove the `schedule:` block |
-| Email is clipped in Gmail | Gmail cuts HTML above roughly 100 KB. Reduce `MAX_STORIES` |
+| Email is clipped in Gmail | Gmail cuts the HTML text above roughly 100 KB (photos don't count). A normal issue is around 35 to 50 KB. If you hit it, reduce `MAX_STORIES` |
+| Email is large (400 to 600 KB) | normal, because of the photos; Gmail allows 25 MB. For smaller mail, lower `MAX_IMAGES`, `IMAGE_SHARE`, the JPEG `quality` in `vintage_jpeg`, or the photo sizes in `make_email` |
 | Email is very late with GitHub's scheduler | expected. Use the Cloudflare trigger instead |
 
 ---
@@ -410,3 +396,4 @@ Edit `KEYWORDS`. Every keyword found in a story's title or description adds its 
 - Photos belong to their publishers. This project is meant for a personal digest, so don't republish the emails.
 - Web fonts load in Apple Mail and iOS. Gmail and Outlook fall back to Georgia or Times, which still suits the newspaper look. The blackletter masthead is an image so it appears everywhere.
 - Some feeds change URL or block automated requests, so check the log now and then for `Could not read feed` lines.
+- The GitHub and CISA security sources depend on their public JSON endpoints. If one is renamed or rate-limited, that source will log a failure and the rest of the digest still sends.
