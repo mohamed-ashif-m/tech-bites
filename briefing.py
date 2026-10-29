@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 MASTHEAD_URL = "https://cdn.jsdelivr.net/gh/mohamed-ashif-m/tech-bites@main/assets/masthead.png"
+MASTHEAD_MOBILE_URL = "https://cdn.jsdelivr.net/gh/mohamed-ashif-m/tech-bites@main/assets/masthead-mobile.png"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -83,6 +84,19 @@ FEEDS = [
     {"name": "MEDIANAMA", "url": "https://www.medianama.com/feed/",
      "category": "India & Policy", "base_score": 2},
 
+    # ---- Industry & business news (company moves, layoffs, deals) ----
+    # Feed URLs below are from memory: check the log for "Could not read feed".
+    {"name": "CNBC Technology", "url": "https://www.cnbc.com/id/19854910/device/rss/rss.html",
+     "category": "Business & Industry", "base_score": 3},
+    {"name": "GeekWire", "url": "https://www.geekwire.com/feed/",
+     "category": "Business & Industry", "base_score": 2},
+    {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml",
+     "category": "Business & Industry", "base_score": 2},
+    {"name": "TechCrunch", "url": "https://techcrunch.com/feed/",
+     "category": "Business & Industry", "base_score": 2},
+    {"name": "Economic Times Tech", "url": "https://economictimes.indiatimes.com/tech/rssfeeds/13357270.cms",
+     "category": "India & Policy", "base_score": 2},
+
     # ---- Community signal (aggregator, so lowest base score) ----
     {"name": "Hacker News (200+ points)", "url": "https://hnrss.org/frontpage?points=200",
      "category": "Community", "base_score": 0},
@@ -125,11 +139,28 @@ KEYWORDS = {
     "data center": 2,
     "regulation": 2,
     "outage": 3,
+    # Company moves and business news
+    "layoff": 5,
+    "job cuts": 5,
+    "buyout": 5,
+    "voluntary exit": 5,
+    "voluntary retirement": 5,
+    "workforce": 2,
+    "acquisition": 3,
+    "acquires": 3,
+    "merger": 3,
+    "antitrust": 3,
+    "earnings": 2,
+    "billion": 2,
 }
 
 MAX_STORIES = 30
-MAX_PER_CATEGORY = 4
+MAX_PER_CATEGORY = 3
 LOOKBACK_HOURS = 24
+
+# ---- Cross-source boost: the same event reported by several outlets ranks higher ----
+CROSS_SOURCE_BONUS = 4      # points for each additional outlet covering the same story
+CROSS_SOURCE_BONUS_MAX = 12
 
 # ---- Article photos ----
 SMTP_TIMEOUT = 120        # seconds per network operation (photos make the email large)
@@ -211,6 +242,82 @@ def _sort_key(story):
         story["score"],
         story["published"] or datetime.min.replace(tzinfo=timezone.utc),
     )
+
+
+_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "are", "was", "its", "his", "her",
+    "has", "have", "had", "new", "says", "say", "said", "how", "why", "what", "will", "into",
+    "over", "after", "more", "than", "can", "could", "may", "amid", "about", "just", "now",
+    "not", "but", "you", "your", "all", "one", "out", "get", "gets", "use", "uses", "using",
+    "via", "per", "off", "too", "their", "they", "them", "been", "being", "also", "who",
+    "when", "where", "which", "while", "would", "should", "report", "reports", "update",
+    "updates", "security", "launches", "launch", "released", "releases", "release",
+}
+
+
+def _title_tokens(title):
+    text = re.sub(r"(?<=\d),(?=\d)", "", title.lower())  # 60,000 -> 60000
+    return {t for t in re.findall(r"[a-z0-9]+", text) if len(t) > 2 and t not in _STOPWORDS}
+
+
+def _same_story(tokens, cluster_tokens):
+    shared = len(tokens & cluster_tokens)
+    if shared < 3:
+        return False
+    overlap = shared / max(1, min(len(tokens), len(cluster_tokens)))
+    return overlap >= 0.5 or (shared >= 4 and overlap >= 0.4) or (shared >= 5 and overlap >= 0.3)
+
+
+def merge_related(stories):
+    """Combine headlines about the same event from different outlets.
+
+    The best-scoring version represents the event, gains CROSS_SOURCE_BONUS
+    points per extra outlet (so big stories rise), and remembers who else
+    covered it in story["also"].
+    """
+    clusters = []  # each: {"tokens": set, "members": [stories]}
+    for story in sorted(stories, key=_sort_key, reverse=True):
+        tokens = _title_tokens(story["title"])
+        for cluster in clusters:
+            if _same_story(tokens, cluster["tokens"]):
+                cluster["members"].append(story)
+                cluster["tokens"] |= tokens
+                break
+        else:
+            clusters.append({"tokens": set(tokens), "members": [story]})
+
+    # Different outlets word the same event differently, so join clusters that
+    # have grown similar enough until nothing more merges.
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                if _same_story(clusters[i]["tokens"], clusters[j]["tokens"]):
+                    clusters[i]["members"] += clusters[j]["members"]
+                    clusters[i]["tokens"] |= clusters[j]["tokens"]
+                    del clusters[j]
+                    changed = True
+                    break
+            if changed:
+                break
+
+    merged = []
+    for cluster in clusters:
+        cluster["members"].sort(key=_sort_key, reverse=True)
+        best, rest = cluster["members"][0], cluster["members"][1:]
+        others = []
+        for member in rest:
+            if member["source"] != best["source"] and member["source"] not in others:
+                others.append(member["source"])
+            if not best.get("image_url") and member.get("image_url"):
+                best["image_url"] = member["image_url"]
+        if others:
+            best["score"] += min(CROSS_SOURCE_BONUS * len(others), CROSS_SOURCE_BONUS_MAX)
+            best["also"] = others
+            best["matched"] = best["matched"] + [f"covered by {len(others) + 1} outlets"]
+        merged.append(best)
+    return merged
 
 
 def select_stories(stories):
@@ -311,6 +418,38 @@ def og_image(page_url):
     return None
 
 
+def page_blurb(page_url):
+    """Short description of an article page (og:description / meta description)."""
+    try:
+        _, data = _http_get(page_url, timeout=8, limit=300_000)
+        text = data.decode("utf-8", "ignore")
+        patterns = (
+            r"<meta[^>]+property=[\"']og:description[\"'][^>]+content=[\"']([^\"']+)",
+            r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:description",
+            r"<meta[^>]+name=[\"']description[\"'][^>]+content=[\"']([^\"']+)",
+            r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+name=[\"']description",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                blurb = clean_text(html.unescape(match.group(1)))
+                if len(blurb) >= 40:
+                    return blurb
+    except Exception as exc:
+        logging.info("Description lookup failed for %s (%s)", page_url, exc)
+    return ""
+
+
+def add_community_blurbs(stories):
+    """Hacker News items carry no text, so borrow each article's own summary."""
+    targets = [s for s in stories if s.get("community")]
+    if not targets:
+        return
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for story, blurb in zip(targets, pool.map(lambda s: page_blurb(s["url"]), targets)):
+            story["description"] = blurb
+
+
 def download_image(url):
     """Return raw image bytes if the URL is a usable, large-enough photo."""
     try:
@@ -324,6 +463,24 @@ def download_image(url):
     except Exception as exc:
         logging.info("Image download failed for %s (%s)", url, exc)
         return None
+
+
+def parse_community(raw_summary, entry):
+    """Pull points, comment count and discussion link out of a hnrss item."""
+    text = html.unescape(raw_summary or "")
+    points = re.search(r"Points:\s*(\d+)", text)
+    comments = re.search(r"#\s*Comments:\s*(\d+)", text)
+    discuss = (entry.get("comments") or "").strip()
+    if not discuss:
+        found = re.search(r"https://news\.ycombinator\.com/item\?id=\d+", text)
+        discuss = found.group(0) if found else ""
+    domain = urllib.parse.urlparse(entry.get("link", "")).netloc.removeprefix("www.")
+    return {
+        "points": int(points.group(1)) if points else 0,
+        "comments": int(comments.group(1)) if comments else 0,
+        "discuss": discuss,
+        "domain": domain,
+    }
 
 
 def fetch_images(stories):
@@ -351,7 +508,7 @@ def fetch_images(stories):
                 return story["id"], data
         return story["id"], None
 
-    candidates = stories[:IMAGE_CANDIDATES]
+    candidates = [s for s in stories if not s.get("community")][:IMAGE_CANDIDATES]
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = dict(pool.map(work, candidates))
 
@@ -423,10 +580,11 @@ def collect_stories():
                 if published and published < cutoff:
                     continue
 
-                description = clean_text(
-                    entry.get("summary", "")
-                    or entry.get("description", "")
-                )[:700]
+                raw_summary = entry.get("summary", "") or entry.get("description", "")
+                description = clean_text(raw_summary)[:700]
+                community = parse_community(raw_summary, entry) if feed["category"] == "Community" else None
+                if community:
+                    description = ""  # the feed text is only links and counters
 
                 score, matched = score_story(
                     title, description, feed["base_score"]
@@ -445,13 +603,16 @@ def collect_stories():
                     "published": published,
                     "score": score,
                     "matched": matched,
-                    "image_url": image_from_entry(entry),
+                    "image_url": None if community else image_from_entry(entry),
+                    "community": community,
                 })
 
         except Exception:
             logging.exception("Failed to fetch %s", feed["name"])
 
-    return select_stories(stories)
+    chosen = select_stories(merge_related(stories))
+    add_community_blurbs(chosen)
+    return chosen
 
 
 # --------------------------------------------------------------------------
@@ -479,6 +640,8 @@ a{{color:{INK}}}
   .colr{{border-left:none!important;padding-left:0!important}}
   .fluid{{width:100%!important;max-width:none!important;height:auto!important}}
   .lead{{font-size:26px!important;line-height:1.15!important}}
+  .desk{{display:none!important}}
+  .mob{{display:block!important;max-height:none!important;overflow:visible!important}}
   .leadbox{{padding:6px!important}}
   .leadin{{padding:14px!important}}
   .meta{{font-size:9.5px!important;letter-spacing:.5px!important}}
@@ -509,12 +672,12 @@ def make_email(stories, images=None):
 
     # The lead: best-ranked story among the top few that has a photo.
     lead = None
-    for story in stories[:6]:
+    for story in [s for s in stories if s["category"] != "Community"][:6]:
         if story["id"] in images:
             lead = story
             break
     if lead is None and stories:
-        lead = stories[0]
+        lead = next((s for s in stories if s["category"] != "Community"), stories[0])
 
     sections = {}
     for story in stories:
@@ -550,6 +713,19 @@ def make_email(stories, images=None):
         colour = f" style='color:{DARK_MUTED}'" if dark else ""
         return f"<div class='kick'{colour}>{text}</div>"
 
+    def also_line(story, dark=False):
+        others = story.get("also") or []
+        if not others:
+            return ""
+        names = ", ".join(esc(n) for n in others[:3])
+        extra = f" +{len(others) - 3} more" if len(others) > 3 else ""
+        colour = "#F0C987" if dark else "#5A4A33"
+        return (
+    f"<div style=\"font-family:{BODY_FONT};font-size:13px;font-style:italic;"
+    f"font-weight:bold;color:{colour};padding-top:6px;\">"
+    f"<span style=\"color:{colour}\">Also reported by {names}{extra}</span></div>"
+)
+
     def summary(story, limit):
         if story["description"]:
             return esc(_truncate(story["description"], limit))
@@ -579,22 +755,34 @@ def make_email(stories, images=None):
         f"style='width:100%;max-width:{EMAIL_WIDTH}px;background:{PAPER};border:1px solid {INK}'>"
     )
 
-    # ---- Masthead ----
+    # ---- Masthead: wide version for desktop, compact version for phones ----
     masthead = (
-        f"<img src='{html.escape(MASTHEAD_URL, quote=True)}' width='{CONTENT_WIDTH}' alt='The Tech Bites Daily' class='fluid' "
+        f"<img src='{html.escape(MASTHEAD_URL, quote=True)}' width='{CONTENT_WIDTH}' alt='The Tech Bites Daily' "
+        f"class='fluid desk' "
         f"style='display:block;width:100%;max-width:{CONTENT_WIDTH}px;height:auto;border:0;margin:0 auto'>"
+        # hidden by default; the phone stylesheet swaps it in (clients without
+        # media-query support simply keep the desktop version)
+        f"<img src='{html.escape(MASTHEAD_MOBILE_URL, quote=True)}' width='340' alt='The Tech Bites Daily' "
+        f"class='fluid mob' "
+        f"style='display:none;max-height:0;overflow:hidden;width:100%;max-width:340px;height:auto;border:0;margin:0 auto'>"
     )
     p.append(f"<tr><td class='pad' style='padding:18px 32px 0'>{masthead}</td></tr>")
 
-    # ---- Dateline ----
+    # ---- Dateline: three columns on desktop, two centred lines on phones ----
     p.append(
         f"<tr><td class='pad' style='padding:6px 32px 0'>"
-        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
-        f"style='border-bottom:1px solid {INK}'><tr>"
-        f"<td class='meta' align='left' style='padding:4px 0'>{esc(today)}</td>"
-        f"<td class='meta' align='center' style='padding:4px 0'>Vol. I · No. {issue_no}</td>"
-        f"<td class='meta' align='right' style='padding:4px 0'>{len(stories)} dispatches</td>"
-        "</tr></table></td></tr>"
+        f"<table role='presentation' class='desk' width='100%' cellpadding='0' cellspacing='0' "
+        f"style='border-bottom:1px solid {INK};table-layout:fixed'><tr>"
+        f"<td class='meta' width='33%' align='left' style='padding:4px 0'>{esc(today)}</td>"
+        f"<td class='meta' width='33%' align='center' style='padding:4px 0'>Vol. I · No. {issue_no}</td>"
+        f"<td class='meta' width='33%' align='right' style='padding:4px 0'>{len(stories)} dispatches</td>"
+        "</tr></table>"
+        f"<div class='mob meta' style='display:none;max-height:0;overflow:hidden;text-align:center;"
+        f"padding:7px 0 8px;border-bottom:1px solid {INK}'>"
+        f"<div style='font-size:11px;letter-spacing:1.2px'>{esc(today)}</div>"
+        f"<div style='font-size:9.5px;letter-spacing:1.4px;margin-top:4px;color:#6B5E48'>"
+        f"Vol. I · No. {issue_no} · {len(stories)} dispatches</div></div>"
+        "</td></tr>"
     )
 
     if not stories:
@@ -621,6 +809,7 @@ def make_email(stories, images=None):
             f"font-size:32px;line-height:1.12'>{esc(lead['title'])}</a>"
             f"{photo(lead, (1000, 500), LEAD_PHOTO_WIDTH, border=DARK_MUTED)}"
             f"<p class='body' style='font-size:15px;color:{DARK_TEXT}'>{summary(lead, 420)}</p>"
+            f"{also_line(lead, dark=True)}"
             f"<p style='margin:12px 0 0'><a href='{url}' class='more' "
             f"style='color:{PAPER}'>Continue reading →</a></p>"
             "</div></td></tr></table></td></tr>"
@@ -641,6 +830,7 @@ def make_email(stories, images=None):
             f"<a href='{url}' class='head' style='display:block;margin:5px 0 0;color:{INK};"
             f"font-size:{size}px;line-height:1.2'>{esc(story['title'])}</a>"
             f"<p class='body'>{summary(story, limit)}</p>"
+            f"{also_line(story)}"
             f"<p style='margin:8px 0 0'><a href='{url}' class='more' style='color:{INK}'>Read on →</a></p>"
         )
 
@@ -673,7 +863,55 @@ def make_email(stories, images=None):
                     f"{cell(pair[0], wide=True, with_photo=with_photo)}</td></tr>"
                 )
 
+    def add_community(items):
+        """'Talk of the Town': a ranked board with a vote stamp per story."""
+        items = sorted(items, key=lambda x: -(x["community"] or {}).get("points", 0))
+        p.append(
+            "<tr><td class='pad' style='padding:24px 32px 0'>"
+            f"<div class='sec' style='border-top:3px double {INK};border-bottom:1px solid {INK};"
+            f"padding:7px 0 3px'>Talk of the Town</div>"
+            f"<div style=\"font-family:{BODY_FONT};font-size:12px;font-style:italic;text-align:center;"
+            f"color:#5A4A33;padding:5px 0 7px;border-bottom:1px solid {INK}\">"
+            "What the developer crowd is voting up and arguing over on Hacker News</div></td></tr>"
+        )
+        for rank, story in enumerate(items, 1):
+            c = story["community"] or {}
+            url = esc(story["url"], quote=True)
+            discuss = esc(c.get("discuss") or story["url"], quote=True)
+            hot = c.get("points", 0) >= 500
+            if story["description"]:
+                blurb = f"<p class='body' style='margin:6px 0 0'>{esc(_truncate(story['description'], 200))}</p>"
+            else:
+                blurb = ""
+            stamp_bg, stamp_fg = (DARK, PAPER) if hot else ("transparent", INK)
+            fire = "<div style=\"font-size:9px;letter-spacing:1.5px;color:#F0C987;margin-top:2px\">HOT</div>" if hot else ""
+            p.append(
+                "<tr><td class='pad' style='padding:0 32px'>"
+                f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+                f"style='border-bottom:1px solid {RULE_SOFT}'><tr>"
+                f"<td width='64' valign='top' style='padding:14px 0'>"
+                f"<div style=\"width:56px;text-align:center;padding:7px 0;border:2px solid {INK};"
+                f"background:{stamp_bg};color:{stamp_fg};font-family:{HEAD_FONT};\">"
+                f"<div style=\"font-size:22px;font-weight:900;line-height:1\">{c.get('points', 0)}</div>"
+                f"<div style=\"font-family:{BODY_FONT};font-size:9px;letter-spacing:1.5px;"
+                f"text-transform:uppercase;margin-top:3px\">points</div>{fire}</div></td>"
+                f"<td valign='top' style='padding:14px 0 14px 14px'>"
+                f"<div class='kick'>No. {rank} · {esc(c.get('domain') or story['source'])} · "
+                f"{_fmt_dt(story['published'])}</div>"
+                f"<a href='{url}' class='head' style='display:block;margin:4px 0 0;color:{INK};"
+                f"font-size:18px;line-height:1.2'>{esc(story['title'])}</a>"
+                f"{blurb}"
+                f"<div style=\"font-family:{BODY_FONT};font-size:12.5px;margin-top:7px;color:#2B251D\">"
+                f"<b>{c.get('comments', 0)}</b> comments &nbsp;·&nbsp; "
+                f"<a href='{discuss}' class='more' style='color:{INK}'>Join the discussion →</a>"
+                f" &nbsp;·&nbsp; <a href='{url}' class='more' style='color:{INK}'>Read the article →</a>"
+                "</div></td></tr></table></td></tr>"
+            )
+
     for category, items in sections.items():
+        if category == "Community":
+            add_community(items)
+            continue
         p.append(
             "<tr><td class='pad' style='padding:24px 32px 0'>"
             f"<div class='sec' style='border-top:3px double {INK};border-bottom:1px solid {INK};"
