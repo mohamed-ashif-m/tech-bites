@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import json
 import html
 import smtplib
 import hashlib
@@ -37,9 +38,13 @@ FEEDS = [
      "category": "Open Source", "base_score": 2},
 
     # ---- Security ----
-    {"name": "GitHub Security Advisories", "url": "https://github.com/advisories.atom",
+    # These two have no working RSS feed, so they are read from their JSON data instead.
+    {"name": "GitHub Security Advisories", "format": "github_advisories",
+     "url": "https://api.github.com/advisories?type=reviewed&severity=critical&per_page=20",
      "category": "Security", "base_score": 4},
-    {"name": "CISA Advisories", "url": "https://www.cisa.gov/cybersecurity-advisories/all.xml",
+    {"name": "CISA Known Exploited", "format": "cisa_kev",
+     "url": ["https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+             "https://raw.githubusercontent.com/cisagov/kev-data/develop/known_exploited_vulnerabilities.json"],
      "category": "Security", "base_score": 4},
     {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/",
      "category": "Security", "base_score": 2},
@@ -397,6 +402,86 @@ def _http_get(url, timeout, limit):
         return content_type, response.read(limit)
 
 
+def _struct(dt):
+    return dt.astimezone(timezone.utc).timetuple()
+
+
+def _json_get(urls):
+    """Fetch JSON from the first URL that works (a list of mirrors is allowed)."""
+    last = None
+    for url in ([urls] if isinstance(urls, str) else urls):
+        for attempt in range(2):
+            try:
+                _, data = _http_get(url, timeout=20, limit=5_000_000)
+                return json.loads(data.decode("utf-8", "ignore"))
+            except Exception as exc:
+                last = exc
+                time.sleep(2)
+    raise last
+
+
+def github_advisory_entries(feed, cutoff):
+    """Newest critical, reviewed GitHub security advisories."""
+    out = []
+    for item in _json_get(feed["url"]):
+        stamp = item.get("published_at") or ""
+        if not stamp:
+            continue
+        when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if when < cutoff:
+            continue
+        ident = item.get("cve_id") or item.get("ghsa_id") or ""
+        out.append({
+            "title": f"Critical flaw: {item.get('summary', 'Security advisory')} ({ident})",
+            "link": item.get("html_url", ""),
+            "summary": f"Critical security advisory. {item.get('description', '')}"[:700],
+            "published_parsed": _struct(when),
+        })
+    return out[:5]
+
+
+def cisa_kev_entries(feed, cutoff):
+    """Vulnerabilities CISA recently added to its Known Exploited list."""
+    now = datetime.now(timezone.utc)
+    out = []
+    for item in _json_get(feed["url"]).get("vulnerabilities", []):
+        try:
+            day = datetime.fromisoformat(item["dateAdded"]).replace(tzinfo=timezone.utc)
+        except (KeyError, ValueError):
+            continue
+        when = min(now, day + timedelta(hours=23, minutes=59))  # only the date is published
+        if when < cutoff:
+            continue
+        cve = item.get("cveID", "")
+        name = f"{item.get('vendorProject', '')} {item.get('product', '')}".strip()
+        out.append({
+            "title": f"CISA warns of actively exploited {name} flaw ({cve})",
+            "link": f"https://nvd.nist.gov/vuln/detail/{cve}",
+            "summary": f"Known exploited vulnerability. {item.get('shortDescription', '')} "
+                       f"Required action: {item.get('requiredAction', '')}"[:700],
+            "published_parsed": _struct(when),
+        })
+    out.sort(key=lambda e: e["published_parsed"], reverse=True)
+    return out[:5]
+
+
+def parse_feed_with_retry(url, attempts=3):
+    """feedparser.parse, retried: home connections drop requests now and then."""
+    parsed = None
+    for attempt in range(1, attempts + 1):
+        try:
+            parsed = feedparser.parse(url, request_headers={"User-Agent": "DailyTechBriefing/1.0"})
+            if parsed.entries or not parsed.bozo:
+                return parsed
+        except Exception as exc:
+            logging.info("Feed request failed (%s), attempt %d/%d", exc, attempt, attempts)
+        if attempt < attempts:
+            time.sleep(2 * attempt)
+    if parsed is None:
+        raise ConnectionError(f"could not reach {url}")
+    return parsed
+
+
 def og_image(page_url):
     """Fallback: read the article page's social-preview image (og:image)."""
     try:
@@ -453,7 +538,11 @@ def add_community_blurbs(stories):
 def download_image(url):
     """Return raw image bytes if the URL is a usable, large-enough photo."""
     try:
-        content_type, data = _http_get(url, timeout=10, limit=MAX_DOWNLOAD_BYTES)
+        try:
+            content_type, data = _http_get(url, timeout=12, limit=MAX_DOWNLOAD_BYTES)
+        except Exception:  # one quick retry for dropped connections / TLS timeouts
+            time.sleep(1.5)
+            content_type, data = _http_get(url, timeout=12, limit=MAX_DOWNLOAD_BYTES)
         if not content_type.lower().startswith("image/") or "svg" in content_type.lower():
             return None
         with Image.open(io.BytesIO(data)) as probe:
@@ -531,7 +620,7 @@ def vintage_jpeg(data, size):
         gray = ImageOps.autocontrast(ImageOps.grayscale(image), cutoff=1)
         image = ImageOps.colorize(gray, black="#1B1208", mid="#8A6F4D", white="#F2E4C4")
         out = io.BytesIO()
-        image.save(out, "JPEG", quality=66, optimize=True, progressive=True)
+        image.save(out, "JPEG", quality=60, optimize=True, progressive=True)
         return out.getvalue()
     except Exception as exc:
         logging.info("Could not process image (%s)", exc)
@@ -546,22 +635,21 @@ def collect_stories():
 
     for feed in FEEDS:
         try:
-            parsed_feed = feedparser.parse(
-                feed["url"],
-                request_headers={"User-Agent": "DailyTechBriefing/1.0"},
-            )
+            kind = feed.get("format")
+            if kind == "github_advisories":
+                entries = github_advisory_entries(feed, cutoff)
+            elif kind == "cisa_kev":
+                entries = cisa_kev_entries(feed, cutoff)
+            else:
+                parsed_feed = parse_feed_with_retry(feed["url"])
+                if parsed_feed.bozo and not parsed_feed.entries:
+                    logging.warning("Could not read feed: %s", feed["name"])
+                    continue
+                entries = parsed_feed.entries
 
-            if parsed_feed.bozo and not parsed_feed.entries:
-                logging.warning("Could not read feed: %s", feed["name"])
-                continue
+            logging.info("%s: fetched %d entries", feed["name"], len(entries))
 
-            logging.info(
-                "%s: fetched %d entries",
-                feed["name"],
-                len(parsed_feed.entries),
-            )
-
-            for entry in parsed_feed.entries:
+            for entry in entries:
                 title = clean_text(entry.get("title", "Untitled"))
                 url = entry.get("link", "").strip()
 
@@ -807,7 +895,7 @@ def make_email(stories, images=None):
             f"{kicker(lead, with_category=True, dark=True)}"
             f"<a href='{url}' class='head lead' style='display:block;margin:6px 0 14px;color:{PAPER};"
             f"font-size:32px;line-height:1.12'>{esc(lead['title'])}</a>"
-            f"{photo(lead, (1000, 500), LEAD_PHOTO_WIDTH, border=DARK_MUTED)}"
+            f"{photo(lead, (900, 450), LEAD_PHOTO_WIDTH, border=DARK_MUTED)}"
             f"<p class='body' style='font-size:15px;color:{DARK_TEXT}'>{summary(lead, 420)}</p>"
             f"{also_line(lead, dark=True)}"
             f"<p style='margin:12px 0 0'><a href='{url}' class='more' "
@@ -820,8 +908,8 @@ def make_email(stories, images=None):
         url = esc(story["url"], quote=True)
         img = ""
         if with_photo:
-            img = (photo(story, (1000, 420), CONTENT_WIDTH) if wide
-               else photo(story, (520, 347), GRID_PHOTO_WIDTH))
+            img = (photo(story, (900, 378), CONTENT_WIDTH) if wide
+               else photo(story, (480, 320), GRID_PHOTO_WIDTH))
         size = 22 if wide else 18
         # text-only stories have more room, so they can carry a longer summary
         limit = (300 if wide else 220) if not with_photo else (260 if wide else 170)
